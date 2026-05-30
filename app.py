@@ -6,15 +6,20 @@ import base64
 import io
 import cv2
 from PIL import Image
+import threading
 
 import tensorflow as tf
 from tensorflow.keras.applications.mobilenet_v3 import preprocess_input
-from tensorflow.keras.layers import *
+from tensorflow.keras.layers import (
+    GlobalAveragePooling2D, GlobalMaxPooling2D, Dense, Reshape,
+    Multiply, Add, Lambda, Concatenate, Conv2D, Input,
+    BatchNormalization, Dropout
+)
 from tensorflow.keras.models import Model
+from tensorflow.keras.applications import MobileNetV3Small
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, session
 from flask_cors import CORS
-
 
 # ─────────────────────────────────
 # CONFIG
@@ -22,23 +27,27 @@ from flask_cors import CORS
 
 MODEL_PATH = "deepfake_mobilenetv3_attention.h5"
 IMG_SIZE   = 192
-THRESHOLD  = 0.5        # neutral starting point — tune after checking DEBUG logs
-BUFFER_MAX = 5          # temporal smoothing window
 
-# global smoothing buffer (reset on no-face frames)
-score_buffer = []
+# THRESHOLD: score > 0.5 → model leans toward class-1
+# After inversion fix: high score = REAL, low score = DEEPFAKE
+# So is_fake = smooth_score < 0.5
+THRESHOLD  = 0.50
 
-print("Building model...")
+# Per-session smoothing (keyed by session_id sent from frontend)
+session_buffers = {}
+session_lock    = threading.Lock()
+MAX_BUFFER      = 5
 
+print("Building model architecture...")
 
 # ─────────────────────────────────
 # CBAM ATTENTION BLOCK
 # ─────────────────────────────────
 
 def cbam_block(input_feature, ratio=8):
-
     channel = input_feature.shape[-1]
 
+    # ── Channel attention ──
     avg_pool = GlobalAveragePooling2D()(input_feature)
     avg_pool = Dense(channel // ratio, activation="relu")(avg_pool)
     avg_pool = Dense(channel, activation="sigmoid")(avg_pool)
@@ -49,163 +58,126 @@ def cbam_block(input_feature, ratio=8):
 
     channel_attention = Add()([avg_pool, max_pool])
     channel_attention = Reshape((1, 1, channel))(channel_attention)
-
     x = Multiply()([input_feature, channel_attention])
 
-    avg_pool_s = Lambda(lambda z: tf.reduce_mean(z, axis=-1, keepdims=True))(x)
-    max_pool_s = Lambda(lambda z: tf.reduce_max(z,  axis=-1, keepdims=True))(x)
+    # ── Spatial attention ──
+    avg_sp  = Lambda(lambda z: tf.reduce_mean(z, axis=-1, keepdims=True))(x)
+    max_sp  = Lambda(lambda z: tf.reduce_max(z,  axis=-1, keepdims=True))(x)
+    concat  = Concatenate(axis=-1)([avg_sp, max_sp])
+    spatial = Conv2D(1, kernel_size=7, padding="same", activation="sigmoid")(concat)
 
-    concat = Concatenate(axis=-1)([avg_pool_s, max_pool_s])
-
-    spatial_attention = Conv2D(
-        filters=1,
-        kernel_size=7,
-        padding="same",
-        activation="sigmoid"
-    )(concat)
-
-    return Multiply()([x, spatial_attention])
-
+    return Multiply()([x, spatial])
 
 # ─────────────────────────────────
-# BUILD MODEL
+# BUILD MODEL  (identical to training)
 # ─────────────────────────────────
-
-from tensorflow.keras.applications import MobileNetV3Small
 
 input_tensor = Input(shape=(IMG_SIZE, IMG_SIZE, 3))
-
-base_model = MobileNetV3Small(
-    weights=None,
-    include_top=False,
-    input_tensor=input_tensor
-)
+base_model   = MobileNetV3Small(weights=None, include_top=False,
+                                 input_tensor=input_tensor)
 
 x = base_model.output
 x = cbam_block(x)
-
 x = GlobalAveragePooling2D()(x)
 x = BatchNormalization()(x)
-
 x = Dense(256, activation="relu")(x)
 x = Dropout(0.4)(x)
-
-x = Dense(64, activation="relu")(x)
+x = Dense(64,  activation="relu")(x)
 x = Dropout(0.3)(x)
-
 output = Dense(1, activation="sigmoid", dtype="float32")(x)
 
 model = Model(inputs=input_tensor, outputs=output)
-
-# ── load weights safely ──────────────────────────────────────────────────────
-if not os.path.exists(MODEL_PATH):
-    raise FileNotFoundError(f"Model file not found: {MODEL_PATH}")
-
-if os.path.getsize(MODEL_PATH) < 1024:
-    raise ValueError(f"Model file looks corrupt / empty: {MODEL_PATH}")
-
 model.load_weights(MODEL_PATH)
-print("Model loaded successfully")
 
-# ── warm-up pass ─────────────────────────────────────────────────────────────
-dummy = np.zeros((1, IMG_SIZE, IMG_SIZE, 3), dtype=np.float32)
-warmup_score = float(model.predict(dummy, verbose=0)[0][0])
-print(f"[WARMUP] dummy score = {warmup_score:.4f}  (should be near 0.5 for untrained / random)")
+print("✓ Model weights loaded")
 
+# warm-up pass
+model.predict(np.zeros((1, IMG_SIZE, IMG_SIZE, 3)), verbose=0)
+print("✓ Warm-up done")
 
 # ─────────────────────────────────
-# FACE DETECTOR
+# FACE DETECTORS  (cascade + DNN fallback)
 # ─────────────────────────────────
 
-face_detector = cv2.CascadeClassifier(
+# Primary: Haar cascade (fast)
+haar_detector = cv2.CascadeClassifier(
     cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
 )
 
+# Secondary: profile face (catches side angles)
+haar_profile = cv2.CascadeClassifier(
+    cv2.data.haarcascades + "haarcascade_profileface.xml"
+)
+
+
+def detect_face(frame_rgb):
+    """
+    Try frontal → profile → centre-crop.
+    Returns cropped face (RGB ndarray) + bbox or None.
+    """
+    gray = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2GRAY)
+    gray = cv2.equalizeHist(gray)       # equalize only for detection
+
+    # 1) frontal
+    faces = haar_detector.detectMultiScale(
+        gray, scaleFactor=1.05, minNeighbors=3,
+        minSize=(60, 60), flags=cv2.CASCADE_SCALE_IMAGE
+    )
+
+    # 2) profile if frontal failed
+    if len(faces) == 0:
+        faces = haar_profile.detectMultiScale(
+            gray, scaleFactor=1.05, minNeighbors=3, minSize=(60, 60)
+        )
+
+    if len(faces) > 0:
+        # pick largest face
+        x, y, w, h = sorted(faces, key=lambda f: f[2]*f[3], reverse=True)[0]
+        pad = int(0.15 * min(w, h))
+        x1  = max(0, x - pad)
+        y1  = max(0, y - pad)
+        x2  = min(frame_rgb.shape[1], x + w + pad)
+        y2  = min(frame_rgb.shape[0], y + h + pad)
+        face = frame_rgb[y1:y2, x1:x2]
+        return face, [int(x), int(y), int(w), int(h)], True
+
+    # 3) fallback: centre square crop (live feed always has user in centre)
+    h, w = frame_rgb.shape[:2]
+    side  = min(h, w)
+    cx, cy = w // 2, h // 2
+    x1  = cx - side // 2
+    y1  = cy - side // 2
+    face = frame_rgb[y1:y1+side, x1:x1+side]
+    return face, None, False   # no face bbox → caller knows
+
 
 # ─────────────────────────────────
-# GRADCAM HEATMAP
+# GRADCAM
 # ─────────────────────────────────
 
 def gradcam(img_tensor):
-    """Return a (IMG_SIZE × IMG_SIZE) float32 heatmap, or None on failure."""
-    try:
-        last_conv = None
-        for layer in reversed(model.layers):
-            if isinstance(layer, Conv2D):
-                last_conv = layer.name
-                break
+    last_conv = None
+    for layer in reversed(model.layers):
+        if isinstance(layer, Conv2D):
+            last_conv = layer.name
+            break
 
-        if last_conv is None:
-            return None
+    grad_model = tf.keras.models.Model(
+        model.inputs,
+        [model.get_layer(last_conv).output, model.output]
+    )
 
-        grad_model = tf.keras.models.Model(
-            model.inputs,
-            [model.get_layer(last_conv).output, model.output]
-        )
+    with tf.GradientTape() as tape:
+        conv_out, preds = grad_model(img_tensor)
+        loss = preds[:, 0]
 
-        with tf.GradientTape() as tape:
-            conv_outputs, predictions = grad_model(img_tensor)
-            loss = predictions[:, 0]
-
-        grads = tape.gradient(loss, conv_outputs)
-
-        if grads is None:
-            return None
-
-        pooled_grads  = tf.reduce_mean(grads, axis=(0, 1, 2))
-        conv_out_0    = conv_outputs[0]
-        heatmap       = conv_out_0 @ pooled_grads[..., tf.newaxis]
-        heatmap       = tf.squeeze(heatmap)
-        max_val       = tf.math.reduce_max(heatmap)
-
-        if max_val == 0:
-            return None
-
-        heatmap = tf.maximum(heatmap, 0) / max_val
-        return heatmap.numpy()
-
-    except Exception as e:
-        print(f"[GradCAM ERROR] {e}")
-        return None
-
-
-def build_overlay(face_rgb, heatmap_raw):
-    """Overlay GradCAM heatmap on face image; return base64 JPEG string or None."""
-    try:
-        heatmap = cv2.resize(heatmap_raw, (IMG_SIZE, IMG_SIZE))
-        heatmap = np.uint8(255 * heatmap)
-        heatmap = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
-        overlay = cv2.addWeighted(face_rgb, 0.6, heatmap, 0.4, 0)
-        _, buffer = cv2.imencode(".jpg", overlay)
-        return base64.b64encode(buffer).decode()
-    except Exception as e:
-        print(f"[OVERLAY ERROR] {e}")
-        return None
-
-
-# ─────────────────────────────────
-# HELPERS
-# ─────────────────────────────────
-
-def preprocess_face(face_rgb):
-    """Lighting normalisation + resize + model preprocessing."""
-    # histogram equalisation on luminance channel only
-    ycrcb = cv2.cvtColor(face_rgb, cv2.COLOR_RGB2YCrCb)
-    ycrcb[:, :, 0] = cv2.equalizeHist(ycrcb[:, :, 0])
-    face_eq = cv2.cvtColor(ycrcb, cv2.COLOR_YCrCb2RGB)
-
-    face_resized = cv2.resize(face_eq, (IMG_SIZE, IMG_SIZE))
-    arr = np.array(face_resized, dtype=np.float32)
-
-    arr_model = preprocess_input(arr.copy())
-    arr_model = np.expand_dims(arr_model, axis=0)
-
-    return face_resized, arr_model
-
-
-def is_blank_frame(frame_rgb, std_threshold=8.0):
-    """Return True if the frame is nearly uniform (covered camera, etc.)."""
-    return float(np.std(frame_rgb)) < std_threshold
+    grads       = tape.gradient(loss, conv_out)
+    pooled      = tf.reduce_mean(grads, axis=(0, 1, 2))
+    heatmap     = conv_out[0] @ pooled[..., tf.newaxis]
+    heatmap     = tf.squeeze(heatmap)
+    max_val     = tf.math.reduce_max(heatmap)
+    heatmap     = tf.maximum(heatmap, 0) / (max_val + 1e-8)
+    return heatmap.numpy()
 
 
 # ─────────────────────────────────
@@ -213,7 +185,8 @@ def is_blank_frame(frame_rgb, std_threshold=8.0):
 # ─────────────────────────────────
 
 app = Flask(__name__, static_folder=".", static_url_path="")
-CORS(app)
+app.secret_key = os.environ.get("SECRET_KEY", "eamnet-secret-2024")
+CORS(app, supports_credentials=True)
 
 
 @app.route("/")
@@ -221,101 +194,89 @@ def index():
     return app.send_static_file("index.html")
 
 
+@app.route("/reset", methods=["POST"])
+def reset():
+    """Call this when switching between live feed and image upload."""
+    sid = request.json.get("session_id", "default")
+    with session_lock:
+        session_buffers.pop(sid, None)
+    return jsonify({"status": "reset"})
+
+
 # ─────────────────────────────────
-# PREDICT API  (webcam stream)
+# PREDICT  (live webcam frames)
 # ─────────────────────────────────
 
 @app.route("/predict", methods=["POST"])
 def predict():
-
-    global score_buffer
-
     try:
         data    = request.json
+        sid     = data.get("session_id", "default")
         img_b64 = data["image"].split(",")[1]
+
         img_bytes = base64.b64decode(img_b64)
-        img     = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-        frame   = np.array(img)
+        img       = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        frame     = np.array(img)
 
-        # ── blank / covered camera guard ─────────────────────────────────────
-        if is_blank_frame(frame):
-            score_buffer.clear()
-            return jsonify({
-                "score":      0.0,
-                "label":      "NO SIGNAL",
-                "is_fake":    False,
-                "confidence": 0.0,
-                "bbox":       None,
-                "attention":  None,
-                "note":       "Frame appears blank or camera is covered."
-            })
+        # ── Face detection ──
+        face, bbox, face_found = detect_face(frame)
 
-        # ── face detection ───────────────────────────────────────────────────
-        gray  = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-        faces = face_detector.detectMultiScale(gray, scaleFactor=1.3, minNeighbors=5)
+        # ── Preprocess for model ──
+        # Mild CLAHE (contrast limited) — less destructive than full equalizeHist
+        face_lab = cv2.cvtColor(face, cv2.COLOR_RGB2LAB)
+        clahe    = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        face_lab[:, :, 0] = clahe.apply(face_lab[:, :, 0])
+        face_proc = cv2.cvtColor(face_lab, cv2.COLOR_LAB2RGB)
 
-        if len(faces) == 0:
-            # no face — clear buffer so we don't contaminate future frames
-            score_buffer.clear()
-            return jsonify({
-                "score":      0.0,
-                "label":      "NO FACE",
-                "is_fake":    False,
-                "confidence": 0.0,
-                "bbox":       None,
-                "attention":  None,
-                "note":       "No face detected in frame."
-            })
+        face_resized = cv2.resize(face_proc, (IMG_SIZE, IMG_SIZE))
+        arr          = np.array(face_resized, dtype=np.float32)
+        arr_model    = preprocess_input(arr.copy())
+        arr_model    = np.expand_dims(arr_model, axis=0)
 
-        # use the largest detected face
-        faces_sorted = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)
-        x, y, w, h   = faces_sorted[0]
-        pad = int(0.2 * w)
-        x1  = max(0, x - pad)
-        y1  = max(0, y - pad)
-        x2  = min(frame.shape[1], x + w + pad)
-        y2  = min(frame.shape[0], y + h + pad)
-        face_crop = frame[y1:y2, x1:x2]
-        bbox      = [int(x), int(y), int(w), int(h)]
-
-        # ── preprocessing ────────────────────────────────────────────────────
-        face_resized, arr_model = preprocess_face(face_crop)
-
-        # ── model inference ──────────────────────────────────────────────────
         raw_score = float(model.predict(arr_model, verbose=0)[0][0])
 
-        # guard against NaN / Inf (bad weights or preprocessing)
-        if not np.isfinite(raw_score):
-            print(f"[WARN] Non-finite score: {raw_score} — skipping frame")
-            return jsonify({"error": "Model returned non-finite score. Check weights."}), 500
+        # ── Per-session temporal smoothing ──
+        with session_lock:
+            buf = session_buffers.setdefault(sid, [])
+            buf.append(raw_score)
+            if len(buf) > MAX_BUFFER:
+                buf.pop(0)
+            smooth_score = float(np.mean(buf))
 
-        print(f"[DEBUG] raw_score={raw_score:.4f}  faces={len(faces)}")
+        # ── Decision logic (FIXED) ──
+        # Model outputs HIGH score → REAL face
+        #                LOW score → DEEPFAKE / AI-generated
+        # is_fake when score is LOW (< threshold)
+        is_fake = smooth_score < THRESHOLD
 
-        # ── temporal smoothing ───────────────────────────────────────────────
-        score_buffer.append(raw_score)
-        if len(score_buffer) > BUFFER_MAX:
-            score_buffer.pop(0)
-        smooth_score = float(np.mean(score_buffer))
+        # Confidence: how far from 0.5 boundary, scaled to 50–100%
+        distance   = abs(smooth_score - 0.5)          # 0.0 → 0.5
+        confidence = 50.0 + (distance / 0.5) * 50.0  # 50% → 100%
 
-        # ── classification ───────────────────────────────────────────────────
-        #  MODEL CONVENTION: output > THRESHOLD  →  FAKE
-        #  If everything is showing as FAKE, flip to:  smooth_score < THRESHOLD
-        #  Check [DEBUG] logs — if real faces score > 0.65, flip the sign below.
-        is_fake    = smooth_score > THRESHOLD
-        confidence = smooth_score if is_fake else (1.0 - smooth_score)
+        # Bonus: if no face detected in a live frame, nudge toward DEEPFAKE
+        # (real webcam almost always has a detectable face)
+        if not face_found:
+            is_fake    = True
+            confidence = max(confidence, 55.0)
 
-        # ── GradCAM (non-fatal) ──────────────────────────────────────────────
-        heatmap_raw = gradcam(arr_model)
-        attention_b64 = build_overlay(face_resized, heatmap_raw) if heatmap_raw is not None else None
+        # ── GradCAM overlay ──
+        heatmap = gradcam(arr_model)
+        heatmap = cv2.resize(heatmap, (IMG_SIZE, IMG_SIZE))
+        heatmap = np.uint8(255 * heatmap)
+        heatmap = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
+        overlay = cv2.addWeighted(face_resized, 0.6, heatmap, 0.4, 0)
+
+        _, buffer    = cv2.imencode(".jpg", overlay)
+        heatmap_b64  = base64.b64encode(buffer).decode()
 
         return jsonify({
             "score":      round(smooth_score, 4),
-            "raw_score":  round(raw_score,    4),   # useful for debugging
             "label":      "DEEPFAKE" if is_fake else "REAL",
             "is_fake":    bool(is_fake),
-            "confidence": round(confidence * 100, 1),
+            "confidence": round(confidence, 1),
+            "face_found": face_found,
             "bbox":       bbox,
-            "attention":  attention_b64
+            "attention":  heatmap_b64
         })
 
     except Exception as e:
@@ -325,82 +286,54 @@ def predict():
 
 
 # ─────────────────────────────────
-# IMAGE UPLOAD API
+# UPLOAD  (static AI-generated images)
 # ─────────────────────────────────
 
 @app.route("/upload", methods=["POST"])
 def upload():
-
     try:
-        file = request.files["image"]
-        img  = Image.open(file).convert("RGB")
+        file  = request.files["image"]
+        img   = Image.open(file).convert("RGB")
         frame = np.array(img)
 
-        if is_blank_frame(frame):
-            return jsonify({"error": "Uploaded image appears blank."}), 400
+        face, bbox, face_found = detect_face(frame)
 
-        gray  = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-        faces = face_detector.detectMultiScale(gray, scaleFactor=1.3, minNeighbors=5)
+        face_resized = cv2.resize(face, (IMG_SIZE, IMG_SIZE))
+        arr          = np.array(face_resized, dtype=np.float32)
+        arr_model    = preprocess_input(arr.copy())
+        arr_model    = np.expand_dims(arr_model, axis=0)
 
-        if len(faces) > 0:
-            faces_sorted = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)
-            x, y, w, h   = faces_sorted[0]
-            pad = int(0.2 * w)
-            x1  = max(0, x - pad)
-            y1  = max(0, y - pad)
-            x2  = min(frame.shape[1], x + w + pad)
-            y2  = min(frame.shape[0], y + h + pad)
-            roi = frame[y1:y2, x1:x2]
-        else:
-            roi = frame   # fall back to full image if no face found
+        score   = float(model.predict(arr_model, verbose=0)[0][0])
 
-        face_resized, arr_model = preprocess_face(roi)
+        # Same fixed logic: LOW score = DEEPFAKE
+        is_fake = score < THRESHOLD
 
-        score = float(model.predict(arr_model, verbose=0)[0][0])
-
-        if not np.isfinite(score):
-            return jsonify({"error": "Model returned non-finite score."}), 500
-
-        print(f"[DEBUG/upload] score={score:.4f}")
-
-        is_fake    = score > THRESHOLD
-        confidence = score if is_fake else (1.0 - score)
-
-        heatmap_raw   = gradcam(arr_model)
-        attention_b64 = build_overlay(face_resized, heatmap_raw) if heatmap_raw is not None else None
+        distance   = abs(score - 0.5)
+        confidence = 50.0 + (distance / 0.5) * 50.0
 
         return jsonify({
             "score":      round(score, 4),
             "label":      "DEEPFAKE" if is_fake else "REAL",
             "is_fake":    bool(is_fake),
-            "confidence": round(confidence * 100, 1),
-            "attention":  attention_b64
+            "confidence": round(confidence, 1),
+            "face_found": face_found,
+            "bbox":       bbox
         })
 
     except Exception as e:
-        import traceback
-        traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
 
 # ─────────────────────────────────
-# RESET BUFFER  (optional utility)
-# ─────────────────────────────────
-
-@app.route("/reset", methods=["POST"])
-def reset_buffer():
-    global score_buffer
-    score_buffer.clear()
-    return jsonify({"status": "buffer cleared"})
-
-
+# ENTRY POINT
 # ─────────────────────────────────
 
 if __name__ == "__main__":
-    print("Server started on http://0.0.0.0:5000")
+    PORT = int(os.environ.get("PORT", 5000))
+    print(f"Server starting on port {PORT}")
     app.run(
         host="0.0.0.0",
-        port=5000,
+        port=PORT,
         debug=False,
-        threaded=False
+        threaded=True    # allow concurrent requests
     )
