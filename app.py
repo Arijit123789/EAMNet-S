@@ -247,7 +247,7 @@ def predict():
         # Model outputs HIGH score → REAL face
         #                LOW score → DEEPFAKE / AI-generated
         # is_fake when score is LOW (< threshold)
-        is_fake = smooth_score < THRESHOLD
+        is_fake = smooth_score > THRESHOLD
 
         # Confidence: how far from 0.5 boundary, scaled to 50–100%
         distance   = abs(smooth_score - 0.5)          # 0.0 → 0.5
